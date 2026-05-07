@@ -111,8 +111,14 @@ struct qdl_device_desc {
 
 struct qdl_device_desc *usb_list(unsigned int *devices_found);
 
-int firehose_run(struct qdl_device *qdl);
-int firehose_provision(struct qdl_device *qdl);
+enum reset_mode {
+	RESET_NONE,	/* don't reset */
+	RESET_POWER,	/* <power value="reset"/>: regular reboot */
+	RESET_EDL,	/* <power value="edl"/>: reset back into EDL */
+};
+
+int firehose_run(struct qdl_device *qdl, enum reset_mode reset_mode);
+int firehose_provision(struct qdl_device *qdl, enum reset_mode reset_mode);
 int firehose_read_buf(struct qdl_device *qdl, struct read_op *read_op, void *out_buf, size_t out_size);
 int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 	       const char *ramdump_path,

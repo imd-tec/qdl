@@ -933,19 +933,21 @@ static int firehose_set_bootable(struct qdl_device *qdl, int part)
 	return 0;
 }
 
-static int firehose_reset(struct qdl_device *qdl)
+static int firehose_reset(struct qdl_device *qdl, enum reset_mode mode)
 {
 	xmlNode *root;
 	xmlNode *node;
 	xmlDoc *doc;
 	int ret;
 
+	ux_info("sending firehose %s reset\n", mode == RESET_EDL ? "EDL" : "power");
+
 	doc = xmlNewDoc((xmlChar *)"1.0");
 	root = xmlNewNode(NULL, (xmlChar *)"data");
 	xmlDocSetRootElement(doc, root);
 
 	node = xmlNewChild(root, NULL, (xmlChar *)"power", NULL);
-	xml_setpropf(node, "value", "reset");
+	xml_setpropf(node, "value", mode == RESET_EDL ? "edl" : "reset");
 	xml_setpropf(node, "DelayInSeconds", "10"); // Add a delay to prevent reboot fail
 
 	ret = firehose_write(qdl, doc);
@@ -1015,7 +1017,7 @@ static int firehose_detect_and_configure(struct qdl_device *qdl,
 	return 0;
 }
 
-int firehose_provision(struct qdl_device *qdl)
+int firehose_provision(struct qdl_device *qdl, enum reset_mode reset_mode)
 {
 	int ret;
 
@@ -1031,13 +1033,19 @@ int firehose_provision(struct qdl_device *qdl)
 	else
 		ux_info("UFS provisioning failed\n");
 
-	firehose_reset(qdl);
+	/*
+	 * UFS provisioning changes the LUN layout, which only takes effect
+	 * after a power cycle. Always reset, otherwise the firehose
+	 * programmer keeps the old layout and any subsequent flash/patch
+	 * pass against the same session would target stale partitions.
+	 */
+	firehose_reset(qdl, reset_mode == RESET_EDL ? RESET_EDL : RESET_POWER);
 
 	return ret;
 
 }
 
-int firehose_run(struct qdl_device *qdl)
+int firehose_run(struct qdl_device *qdl, enum reset_mode reset_mode)
 {
 	bool multiple;
 	int bootable;
@@ -1084,7 +1092,8 @@ int firehose_run(struct qdl_device *qdl)
 		firehose_set_bootable(qdl, bootable);
 	}
 
-	firehose_reset(qdl);
+	if (reset_mode != RESET_NONE)
+		firehose_reset(qdl, reset_mode);
 
 	return 0;
 }

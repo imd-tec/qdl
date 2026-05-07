@@ -444,6 +444,8 @@ static void print_usage(FILE *out)
 	fprintf(out, " -t, --create-digests=T\t\tGenerate table of digests in the T folder\n");
 	fprintf(out, " -T, --slot=T\t\t\tSet slot number T for multiple storage devices\n");
 	fprintf(out, " -D, --vip-table-path=T\t\tUse digest tables in the T folder for VIP\n");
+	fprintf(out, "     --reset-after=M\t\tReset mode after flashing: none|power|edl (default: power)\n");
+	fprintf(out, " -k, --skip-sahara\t\tSkip Sahara/programmer upload (device already in firehose)\n");
 	fprintf(out, " -h, --help\t\t\tPrint this usage info\n");
 	fprintf(out, " <program-xml>\t\txml file containing <program> or <erase> directives\n");
 	fprintf(out, " <patch-xml>\t\txml file containing <patch> directives\n");
@@ -580,6 +582,8 @@ static int qdl_flash(int argc, char **argv)
 	bool qdl_finalize_provisioning = false;
 	bool allow_fusing = false;
 	bool allow_missing = false;
+	enum reset_mode reset_mode = RESET_POWER;
+	bool skip_sahara = false;
 	long out_chunk_size = 0;
 	unsigned int slot = UINT_MAX;
 	struct qdl_device *qdl = NULL;
@@ -599,11 +603,13 @@ static int qdl_flash(int argc, char **argv)
 		{"dry-run", no_argument, 0, 'n'},
 		{"create-digests", required_argument, 0, 't'},
 		{"slot", required_argument, 0, 'T'},
+		{"reset-after", required_argument, 0, 1000},
+		{"skip-sahara", no_argument, 0, 'k'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:h", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:kh", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -648,6 +654,19 @@ static int qdl_flash(int argc, char **argv)
 		case 'T':
 			slot = (unsigned int)strtoul(optarg, NULL, 10);
 			break;
+		case 1000:
+			if (!strcmp(optarg, "none"))
+				reset_mode = RESET_NONE;
+			else if (!strcmp(optarg, "power"))
+				reset_mode = RESET_POWER;
+			else if (!strcmp(optarg, "edl"))
+				reset_mode = RESET_EDL;
+			else
+				errx(1, "invalid --reset-after value \"%s\" (expected none|power|edl)", optarg);
+			break;
+		case 'k':
+			skip_sahara = true;
+			break;
 		case 'h':
 			print_usage(stdout);
 			return 0;
@@ -657,7 +676,7 @@ static int qdl_flash(int argc, char **argv)
 		}
 	}
 
-	/* at least 2 non optional args required */
+	/* at least 2 non-optional args required: prog.mbn + xml */
 	if ((optind + 2) > argc) {
 		print_usage(stderr);
 		return 1;
@@ -693,9 +712,14 @@ static int qdl_flash(int argc, char **argv)
 	if (qdl_debug)
 		print_version();
 
-	ret = decode_programmer(argv[optind++], sahara_images);
-	if (ret < 0)
-		exit(1);
+	if (skip_sahara) {
+		/* keep prog.mbn in argv for command-line consistency, but don't parse/upload it */
+		optind++;
+	} else {
+		ret = decode_programmer(argv[optind++], sahara_images);
+		if (ret < 0)
+			exit(1);
+	}
 
 	do {
 		type = detect_type(argv[optind]);
@@ -758,14 +782,19 @@ static int qdl_flash(int argc, char **argv)
 
 	qdl->storage_type = storage_type;
 
-	ret = sahara_run(qdl, sahara_images, NULL, NULL);
-	if (ret < 0)
-		goto out_cleanup;
+	if (!skip_sahara) {
+		ret = sahara_run(qdl, sahara_images, NULL, NULL);
+		if (ret < 0)
+			goto out_cleanup;
+	}
 
-	if (ufs_need_provisioning())
-		ret = firehose_provision(qdl);
-	else
-		ret = firehose_run(qdl);
+	if (ufs_need_provisioning()) {
+		if (reset_mode == RESET_NONE)
+			ux_info("--reset-after=none ignored for UFS provisioning; LUN layout requires a reset to take effect\n");
+		ret = firehose_provision(qdl, reset_mode);
+	} else {
+		ret = firehose_run(qdl, reset_mode);
+	}
 	if (ret < 0)
 		goto out_cleanup;
 

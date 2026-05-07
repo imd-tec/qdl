@@ -119,6 +119,8 @@ static void sahara_send_reset(struct qdl_device *qdl)
 {
 	struct sahara_pkt resp;
 
+	ux_info("sending Sahara reset\n");
+
 	resp.cmd = SAHARA_RESET_CMD;
 	resp.length = SAHARA_RESET_LENGTH;
 
