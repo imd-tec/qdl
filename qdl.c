@@ -432,6 +432,7 @@ static void print_usage(FILE *out)
 	fprintf(out, "       %s [options] <prog.mbn> ((read | write) <address> <binary>)...\n", __progname);
 	fprintf(out, "       %s list\n", __progname);
 	fprintf(out, "       %s ramdump [--debug] [-o <ramdump-path>] [<segment-filter>,...]\n", __progname);
+	fprintf(out, "       %s chipinfo [--debug] [-S <serial>]\n", __progname);
 	fprintf(out, " -d, --debug\t\t\tPrint detailed debug info\n");
 	fprintf(out, " -v, --version\t\t\tPrint the current version and exit\n");
 	fprintf(out, " -n, --dry-run\t\t\tDry run execution, no device reading or flashing\n");
@@ -480,6 +481,60 @@ static int qdl_list(FILE *out)
 	free(devices);
 
 	return 0;
+}
+
+static int qdl_chipinfo(int argc, char **argv)
+{
+	struct qdl_device *qdl;
+	char *serial = NULL;
+	int ret = 0;
+	int opt;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+			print_usage(stdout);
+			return 0;
+		default:
+			print_usage(stderr);
+			return 1;
+		}
+	}
+
+	ux_init();
+
+	qdl = qdl_init(QDL_DEVICE_USB);
+	if (!qdl)
+		return 1;
+
+	ret = qdl_open(qdl, serial);
+	if (ret) {
+		ret = 1;
+		goto out_cleanup;
+	}
+
+	ret = sahara_chipinfo(qdl);
+	if (ret < 0)
+		ret = 1;
+
+out_cleanup:
+	qdl_close(qdl);
+	qdl_deinit(qdl);
+
+	return ret;
 }
 
 static int qdl_ramdump(int argc, char **argv)
@@ -828,6 +883,8 @@ int main(int argc, char **argv)
 		return qdl_list(stdout);
 	if (argc >= 2 && !strcmp(argv[1], "ramdump"))
 		return qdl_ramdump(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "chipinfo"))
+		return qdl_chipinfo(argc - 1, argv + 1);
 
 	return qdl_flash(argc, argv);
 }

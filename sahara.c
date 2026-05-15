@@ -57,6 +57,16 @@
 #define SAHARA_DONE_LENGTH		0x8
 #define SAHARA_DONE_RESP_LENGTH		0xc
 #define SAHARA_RESET_LENGTH		0x8
+#define SAHARA_EXECUTE_LENGTH		0xc
+#define SAHARA_EXECUTE_RESP_LENGTH	0x10
+#define SAHARA_EXECUTE_DATA_LENGTH	0xc
+
+/* Sub-commands for SAHARA_EXECUTE_CMD (command mode, min protocol 2.1) */
+#define SAHARA_EXEC_CMD_SERIAL_NUM_READ		0x01
+#define SAHARA_EXEC_CMD_MSM_HW_ID_READ		0x02
+#define SAHARA_EXEC_CMD_OEM_PK_HASH_READ	0x03
+#define SAHARA_EXEC_CMD_GET_SBL_VERSION		0x07
+#define SAHARA_EXEC_CMD_READ_CHIP_ID_V3		0x0a
 
 #define DEBUG_BLOCK_SIZE (512u * 1024u)
 
@@ -104,6 +114,13 @@ struct sahara_pkt {
 			uint64_t offset;
 			uint64_t length;
 		} read64_req;
+		struct {
+			uint32_t client_command;
+		} execute_req;
+		struct {
+			uint32_t client_command;
+			uint32_t data_length;
+		} execute_resp;
 	};
 };
 
@@ -511,4 +528,189 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 	}
 
 	return done ? 0 : -1;
+}
+
+static int sahara_cmd_exec(struct qdl_device *qdl, uint32_t subcmd,
+			   void *buf, size_t buf_size, size_t *out_len)
+{
+	struct sahara_pkt req = {};
+	struct sahara_pkt resp;
+	uint32_t data_len;
+	int n;
+
+	req.cmd = SAHARA_EXECUTE_CMD;
+	req.length = SAHARA_EXECUTE_LENGTH;
+	req.execute_req.client_command = subcmd;
+
+	n = qdl_write(qdl, &req, SAHARA_EXECUTE_LENGTH, SAHARA_CMD_TIMEOUT_MS);
+	if (n < 0)
+		return -1;
+
+	n = qdl_read(qdl, &resp, sizeof(resp), SAHARA_CMD_TIMEOUT_MS);
+	if (n < 0)
+		return -1;
+	if (resp.cmd != SAHARA_EXECUTE_RESP_CMD) {
+		ux_debug("subcmd 0x%x: expected EXECUTE_RESP, got cmd 0x%x\n",
+			 subcmd, resp.cmd);
+		return -1;
+	}
+
+	data_len = resp.execute_resp.data_length;
+	if (data_len == 0 || data_len > buf_size) {
+		ux_debug("subcmd 0x%x: bad data_length %u (max %zu)\n",
+			 subcmd, data_len, buf_size);
+		return -1;
+	}
+
+	req.cmd = SAHARA_EXECUTE_DATA_CMD;
+	req.length = SAHARA_EXECUTE_DATA_LENGTH;
+	req.execute_req.client_command = subcmd;
+
+	n = qdl_write(qdl, &req, SAHARA_EXECUTE_DATA_LENGTH, SAHARA_CMD_TIMEOUT_MS);
+	if (n < 0)
+		return -1;
+
+	n = qdl_read(qdl, buf, data_len, SAHARA_CMD_TIMEOUT_MS);
+	if (n < 0 || (uint32_t)n != data_len) {
+		ux_debug("subcmd 0x%x: short EXECUTE_DATA payload (%d/%u)\n",
+			 subcmd, n, data_len);
+		return -1;
+	}
+
+	*out_len = data_len;
+	return 0;
+}
+
+static void print_hex(const char *label, const void *buf, size_t len)
+{
+	const uint8_t *b = buf;
+	char hex[3 * 256 + 1];
+	size_t i;
+
+	if (len > 256)
+		len = 256;
+
+	for (i = 0; i < len; i++)
+		sprintf(hex + i * 2, "%02x", b[i]);
+	hex[len * 2] = '\0';
+
+	ux_info("%s: %s\n", label, hex);
+}
+
+int sahara_chipinfo(struct qdl_device *qdl)
+{
+	struct sahara_pkt resp = {};
+	struct sahara_pkt *pkt;
+	uint32_t hello_version = 0;
+	uint8_t payload[256];
+	uint8_t buf[4096];
+	size_t plen;
+	int n;
+
+	if (qdl->dev_type == QDL_DEVICE_SIM)
+		return 0;
+
+	/* Wait for the device's HELLO packet. */
+	n = qdl_read(qdl, buf, sizeof(buf), SAHARA_CMD_TIMEOUT_MS);
+	if (n < 0) {
+		ux_err("failed to read sahara HELLO\n");
+		return -1;
+	}
+
+	pkt = (struct sahara_pkt *)buf;
+	if (pkt->cmd != SAHARA_HELLO_CMD) {
+		ux_err("expected HELLO (0x1), got cmd 0x%x\n", pkt->cmd);
+		return -1;
+	}
+
+	hello_version = pkt->hello_req.version;
+	ux_info("Sahara protocol version %u, max_len %u\n",
+		hello_version, pkt->hello_req.max_len);
+
+	/* Reply with HELLO_RESP requesting command mode. */
+	resp.cmd = SAHARA_HELLO_RESP_CMD;
+	resp.length = SAHARA_HELLO_LENGTH;
+	resp.hello_resp.version = SAHARA_VERSION;
+	resp.hello_resp.compatible = 1;
+	resp.hello_resp.status = SAHARA_SUCCESS;
+	resp.hello_resp.mode = SAHARA_MODE_COMMAND;
+
+	n = qdl_write(qdl, &resp, SAHARA_HELLO_LENGTH, SAHARA_CMD_TIMEOUT_MS);
+	if (n < 0) {
+		ux_err("failed to send HELLO_RESP\n");
+		return -1;
+	}
+
+	/* Expect CMD_READY back. */
+	n = qdl_read(qdl, buf, sizeof(buf), SAHARA_CMD_TIMEOUT_MS);
+	if (n < 0) {
+		ux_err("device did not accept command mode (no CMD_READY)\n");
+		return -1;
+	}
+
+	pkt = (struct sahara_pkt *)buf;
+	if (pkt->cmd != SAHARA_CMD_READY_CMD) {
+		ux_err("expected CMD_READY (0xb), got cmd 0x%x\n", pkt->cmd);
+		return -1;
+	}
+
+	/* Serial number: u32 little-endian. */
+	if (!sahara_cmd_exec(qdl, SAHARA_EXEC_CMD_SERIAL_NUM_READ,
+			     payload, sizeof(payload), &plen) && plen >= 4) {
+		uint32_t serial;
+
+		memcpy(&serial, payload, sizeof(serial));
+		ux_info("Serial Number: 0x%08x\n", serial);
+	} else {
+		ux_info("Serial Number: <unavailable>\n");
+	}
+
+	/* MSM HWID: u64 little-endian (legacy, pre-v3). */
+	if (!sahara_cmd_exec(qdl, SAHARA_EXEC_CMD_MSM_HW_ID_READ,
+			     payload, sizeof(payload), &plen) && plen >= 8) {
+		uint64_t hwid;
+
+		memcpy(&hwid, payload, sizeof(hwid));
+		ux_info("MSM HWID: 0x%016llx\n", (unsigned long long)hwid);
+	}
+
+	/* OEM public-key hash (variable length). */
+	if (!sahara_cmd_exec(qdl, SAHARA_EXEC_CMD_OEM_PK_HASH_READ,
+			     payload, sizeof(payload), &plen) && plen > 0)
+		print_hex("OEM PK Hash", payload, plen);
+
+	/* SBL software version. */
+	if (!sahara_cmd_exec(qdl, SAHARA_EXEC_CMD_GET_SBL_VERSION,
+			     payload, sizeof(payload), &plen) && plen >= 4) {
+		uint32_t ver;
+
+		memcpy(&ver, payload, sizeof(ver));
+		ux_info("SBL Version: 0x%08x\n", ver);
+	}
+
+	/* Chip ID V3 (Sahara protocol 3+ on SM8550-class parts). */
+	if (hello_version >= 3 &&
+	    !sahara_cmd_exec(qdl, SAHARA_EXEC_CMD_READ_CHIP_ID_V3,
+			     payload, sizeof(payload), &plen) && plen >= 44) {
+		uint32_t chip_id;
+		uint32_t msm_id;
+		uint16_t oem_id;
+		uint16_t model_id;
+
+		memcpy(&chip_id, payload + 0,  sizeof(chip_id));
+		memcpy(&msm_id,  payload + 36, sizeof(msm_id));
+		memcpy(&oem_id,  payload + 40, sizeof(oem_id));
+		memcpy(&model_id, payload + 42, sizeof(model_id));
+
+		ux_info("Chip Identifier V3: 0x%08x\n", chip_id);
+		ux_info("MSM ID: 0x%08x  OEM ID: 0x%04x  Model ID: 0x%04x\n",
+			msm_id, oem_id, model_id);
+	}
+
+	sahara_send_reset(qdl);
+
+	/* Drain RESET_RESP (best-effort). */
+	qdl_read(qdl, buf, sizeof(buf), SAHARA_CMD_TIMEOUT_MS);
+
+	return 0;
 }
